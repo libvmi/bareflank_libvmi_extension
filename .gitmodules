@@ -1,0 +1,6 @@
+[submodule "hypervisor"]
+	path = hypervisor
+	url = https://github.com/Bareflank/hypervisor
+[submodule "extended_apis"]
+	path = extended_apis
+	url = https://github.com/Bareflank/extended_apis
