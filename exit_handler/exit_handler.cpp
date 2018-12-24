@@ -26,6 +26,7 @@
 #include <string.h>
 #include <eapis/hve/arch/intel_x64/vcpu.h>
 #include <eapis/hve/arch/intel_x64/vmexit/cpuid.h>
+#include <bfcallonce.h>
 
 using nlohmann::json;
 using namespace eapis::intel_x64;
@@ -46,22 +47,14 @@ typedef enum hcall {
     HCALL_MAP_PA
 } hcall_t;
 
-bool g_guest_map_created;
+
+bfn::once_flag flag{};
 ept::mmap g_guest_map;
 
-void populate_guest_mmap()
+void create_ept(void)
 {
-    bfignored(g_mm);
-
-    if (g_guest_map_created)
-        return;
-
-    ept::identity_map(
-        g_guest_map,
-        MAX_PHYS_ADDR
-    );
-
-    g_guest_map_created = 1;
+    ept::identity_map(g_guest_map, MAX_PHYS_ADDR);
+    ::intel_x64::vmx::invept_global();
 }
 
 class vcpu : public eapis::intel_x64::vcpu
@@ -75,7 +68,9 @@ public:
     ~vcpu() = default;
     vcpu(vcpuid::type id) : eapis::intel_x64::vcpu{id}
     {
-        populate_guest_mmap();
+        bfn::call_once(flag, [&] {
+            create_ept();
+        });
 
     	eapis()->set_eptp(g_guest_map);
 
@@ -102,27 +97,32 @@ public:
 
         uint64_t hcall = vmcs->save_state()->rax;
 
-        vmcs->save_state()->r08 = vmcs->save_state()->rax;
-        vmcs->save_state()->rax = HSTATUS_FAILURE;
+        guard_exceptions([&] {
+            switch ( hcall ) {
+                case HCALL_ACK:
+                    create_ept(); // reset EPT
+                    bfdebug_info(0, "vmcall handled");
+                break;
+                case HCALL_GET_REGISTERS:
+                    hcall_get_register_data(vmcs);
+                    break;
+                case HCALL_SET_REGISTERS:
+                    break;
+                case HCALL_TRANSLATE_V2P:
+                    hcall_translate_v2p(vmcs);
+                    break;
+                case HCALL_MAP_PA:
+                    hcall_memmap_ept(vmcs);
+                    break;
+                default:
+                    break;
+            };
 
-        switch ( hcall ) {
-            case HCALL_ACK:
-                bfdebug_info(0, "vmcall handled");
-                break;
-            case HCALL_GET_REGISTERS:
-                hcall_get_register_data(vmcs);
-                break;
-            case HCALL_SET_REGISTERS:
-                break;
-            case HCALL_TRANSLATE_V2P:
-                hcall_translate_v2p(vmcs);
-                break;
-            case HCALL_MAP_PA:
-                hcall_memmap_ept(vmcs);
-                break;
-            default:
-                break;
-        };
+            vmcs->save_state()->rax = HSTATUS_SUCCESS;
+        },
+        [&] {
+            vmcs->save_state()->rax = HSTATUS_FAILURE;
+        });
 
         //else if (id == 5) {
         //    get_memmap_ept(vmcs);
@@ -171,19 +171,16 @@ public:
         auto &&dmp = j.dump();
         __builtin_memcpy(omap.get(), dmp.data(), size);
 
-        vmcs->save_state()->rax = HSTATUS_SUCCESS;
-
         bfdebug_info(0, "get-registers vmcall handled");
     }
 
     void hcall_translate_v2p(gsl::not_null<bfvmm::intel_x64::vmcs *> vmcs) {
-        uint64_t cr3 = vmcs->save_state()->rdi;
-        uint64_t addr = vmcs->save_state()->rsi;
+        auto addr = vmcs->save_state()->rdi;
+        auto cr3 = intel_x64::vmcs::guest_cr3::get();
 
         addr = bfvmm::x64::virt_to_phys_with_cr3(addr, cr3);
 
-        vmcs->save_state()->rsi = addr;
-        vmcs->save_state()->rax = HSTATUS_SUCCESS;
+        vmcs->save_state()->rdi = addr;
 
         bfdebug_info(0, "v2p vmcall handled");
     }
@@ -195,37 +192,29 @@ public:
 
     void hcall_memmap_ept(gsl::not_null<bfvmm::intel_x64::vmcs *> vmcs) {
 
-	    guard_exceptions([&]() {
+        uint64_t addr = vmcs->save_state()->rdi;
+        uint64_t gpa2 = vmcs->save_state()->rsi;
 
-            uint64_t addr = vmcs->save_state()->rdi;
-            uint64_t gpa2 = vmcs->save_state()->rsi;
+        auto cr3 = intel_x64::vmcs::guest_cr3::get();
+        auto gpa1 = bfvmm::x64::virt_to_phys_with_cr3(addr, cr3);
 
-            auto cr3 = intel_x64::vmcs::guest_cr3::get();
-            auto gpa1 = bfvmm::x64::virt_to_phys_with_cr3(addr, cr3);
+        if ( g_guest_map.is_2m(gpa1) ) {
+            /* Change EPT from 2m to 4k */
+            auto gpa1_2m = bfn::upper(gpa1, ::intel_x64::ept::pd::from);
+            ept::identity_map_convert_2m_to_4k(g_guest_map, gpa1_2m);
+        }
 
-            if ( g_guest_map.is_2m(gpa1) ) {
-                /* Change EPT from 2m to 4k */
-                auto gpa1_2m = bfn::upper(gpa1, ::intel_x64::ept::pd::from);
-                ept::identity_map_convert_2m_to_4k(
-                    g_guest_map,
-                    gpa1_2m
-                );
-            }
+        auto gpa1_4k = bfn::upper(gpa1, ::intel_x64::ept::pt::from);
+        auto gpa2_4k = bfn::upper(gpa2, ::intel_x64::ept::pt::from);
 
-            auto gpa1_4k = bfn::upper(gpa1, ::intel_x64::ept::pt::from);
-            auto gpa2_4k = bfn::upper(gpa2, ::intel_x64::ept::pt::from);
+        vmcs->save_state()->rsi = gpa2_4k;
 
-            vmcs->save_state()->rsi = gpa2_4k;
+        auto &pte = g_guest_map.entry(gpa1_4k);
+        ::intel_x64::ept::pt::entry::phys_addr::set(pte, gpa2_4k);
 
-            auto &pte = g_guest_map.entry(gpa1_4k);
-            ::intel_x64::ept::pt::entry::phys_addr::set(pte, gpa2_4k);
-
-            // flush EPT tlb, guest TLB doesn't need to be flushed
-            // as that translation hasn't changed
-	        ::intel_x64::vmx::invept_global();
-
-            vmcs->save_state()->rax = HSTATUS_SUCCESS;
-    	});
+        // flush EPT tlb, guest TLB doesn't need to be flushed
+        // as that translation hasn't changed
+        ::intel_x64::vmx::invept_global();
     }
 };
 
