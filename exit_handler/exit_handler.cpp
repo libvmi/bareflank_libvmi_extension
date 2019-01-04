@@ -80,7 +80,7 @@ public:
         );
 
         eapis()->add_cpuid_handler(
-            1337,
+            0x40001337,
             cpuid_handler::handler_delegate_t::create<vcpu, &vcpu::cpuid_handler>(this)
         );
     }
