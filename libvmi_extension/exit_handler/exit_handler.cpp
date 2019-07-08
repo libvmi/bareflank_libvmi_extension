@@ -29,12 +29,12 @@ typedef enum hstatus {
     HSTATUS_FAILURE
 } hstatus_t;
 
-#define HCALL_INVALID       0
-#define HCALL_ACK           1
-#define HCALL_GET_REGISTERS 2
-#define HCALL_SET_REGISTERS 3
-#define HCALL_TRANSLATE_V2P 4
-#define HCALL_MAP_PA        5
+#define HCALL_INVALID		0xbf05000000000000
+#define HCALL_ACK		0xbf05000000000001
+#define HCALL_GET_REGISTERS	0xbf05000000000002
+#define HCALL_SET_REGISTERS	0xbf05000000000003
+#define HCALL_TRANSLATE_V2P	0xbf05000000000004
+#define HCALL_MAP_PA		0xbf05000000000005
 
 ept::mmap g_guest_map{};
 
@@ -73,7 +73,6 @@ void hcall_translate_v2p(vcpu_t *vcpu)
     auto hpa = vcpu->gva_to_gpa(addr);
 
     vcpu->set_rdi(hpa.first);
-
     bfdebug_info(0, "v2p vmcall handled");
 }
 
@@ -178,6 +177,6 @@ void vcpu_init_nonroot(vcpu_t *vcpu)
     using namespace vmcs_n::exit_reason;
 
     vcpu->set_eptp(g_guest_map);
-    vcpu->add_handler(basic_exit_reason::vmcall, vmcall_handler);
-    vcpu->add_handler(basic_exit_reason::cpuid, cpuid_magic);
+    vcpu->add_exit_handler_for_reason(basic_exit_reason::vmcall, vmcall_handler);
+    vcpu->add_exit_handler_for_reason(basic_exit_reason::cpuid, cpuid_magic);
 }
